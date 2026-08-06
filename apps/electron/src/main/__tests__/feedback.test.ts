@@ -149,7 +149,12 @@ describe('buildFeedbackZip — size budgets follow the server convention', () =>
     return buf
   }
 
-  it('drops the largest files instead of throwing when over the archive budget', async () => {
+  // DEFLATE-compressing the ~30 MB that survives the drop is legitimately
+  // CPU-bound (measured ~3.9s standalone) rather than hung, but vitest's
+  // 5000ms default leaves it almost no margin, so turbo's parallel load in
+  // `make test-all` pushes it over (observed 5042-8025ms). Give it explicit
+  // headroom instead of shrinking below the 35 MB budget it exists to exercise.
+  it('drops the largest files instead of throwing when over the archive budget', { timeout: 20_000 }, async () => {
     // 3 x 15 MB = 45 MB against a 35 MB budget: the biggest must go, and the
     // send must still succeed. Previously this threw and produced nothing.
     await writeFile(join(folder, 'big-a.bin'), noise(15 * 1024 * 1024))
