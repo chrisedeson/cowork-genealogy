@@ -244,7 +244,7 @@ Strict surname + birth-place match:
 | `hasMore` | boolean | `true` when more pages are available (the response includes a `links.next`). |
 | `rankingSkipped` | string \| undefined | Present **only** when `projectPath` was supplied and `subjectId` was not. Names the two features that therefore did not run, and how to get them. **Serialized before `results`** — see below. |
 | `results` | RecordSearchResult[] | The ranked results, best-scoring first. |
-| `jurisdictionHints` | object \| undefined | Present **only** on a marriage search that did not find the subject, made with both `projectPath` and `subjectId`. See below. |
+| `jurisdictionHints` | object \| undefined | Present on a marriage search made with both `projectPath` and `subjectId`, when it either did not find the subject **or** found one but the tree knows a place these people were at or before the search's window. See below. |
 
 ### `rankingSkipped` — saying so when no subject was named
 
@@ -350,12 +350,14 @@ prove nothing about whether coverage rises.** The only signal for that is the
 next live `make e2e-run TEST=jimmie-jewel-neal`, and the number to compare is
 coverage %, not "the field appears".
 
-### `jurisdictionHints` — where else to look when a marriage search does not find the subject
+### `jurisdictionHints` — where else to look after a marriage search
 
 A marriage is filed where the wedding happened, not where the couple later
 lived, and a couple usually married **before** they migrated. So a nil marriage
 search in one jurisdiction is a prompt to try the couple's *earlier* places, not
-a finding that no record exists.
+a finding that no record exists — and a marriage search that **succeeds** in the
+couple's later home has not established that the marriage it found was their
+first, which is the only kind that carries a bride's birth surname.
 
 The tool computes those places itself rather than relying on the caller to
 remember the rule. This is the same reasoning as host-side ranking: a documented
@@ -365,17 +367,89 @@ the family's later residence — the jurisdiction the tree's own marriage fact
 named — while the answering record sat in the husband's birth state, a fact
 already present in the same tree.
 
-Fires when **all** of: the search was marriage-scoped (`recordType: "marriage"`,
-or any `marriagePlace` / `marriageYearFrom` / `marriageYearTo`); the search did
-not find the subject — either `totalMatches` is 0 **or** ranking reported
-`subjectResolvable: false`; the search was scoped to a place **narrower than a
-country**; and both `projectPath` and `subjectId` were supplied.
+Fires when **all** of these hold: the search was marriage-scoped
+(`recordType: "marriage"`, or any `marriagePlace` / `marriageYearFrom` /
+`marriageYearTo`); the search was scoped to a place **narrower than a country**;
+and both `projectPath` and `subjectId` were supplied —
+
+**and then either of two disjoint reasons:**
+
+**(a) The search did not find the subject.** `totalMatches` is 0, **or** ranking
+reported `subjectResolvable: false`. Offers every candidate the tree yields.
+
+**(b) The search was not judged to have missed the subject, and the tree holds a
+placed fact for these people dated at or before `marriageYearFrom ??
+marriageYearTo`, or undated.** Offers only those places. Requires a year window;
+with none there is no proximity signal and only (a) can fire.
+
+"Not judged to have missed" is deliberately weaker than "found the subject".
+When staging or ranking did not run, `ranked` is absent and nothing was
+established either way — the note claims only that the search returned records,
+which is true in every case reaching (b). Undated places are included because
+`rankKey` already ranks them above post-window ones, and excluding them would
+mean a tree whose facts are all undated — the thin compiled trees this targets —
+could never fire (b) at all.
+
+Reason (b) exists because (a) alone made the hint go quiet at the exact moment
+the trap springs. A marriage search aimed at the wrong jurisdiction still
+*succeeds* there, and success switched the hint off. The measured case, from
+`run-2026-07-31_13-02-13` — the only run built with the full (a) trigger — is a
+groom-anchored search of Hill County, Texas for 1878-1884 that returned "James M
+Neal and Mattie Landham" at `matchConfidence: 5`. Ranking resolved the subject,
+the hint stayed silent, and the record naming the bride's birth surname is an
+1875 marriage in Nevada County, Arkansas — the husband's birth state, already
+present in the same tree. Across seven runs of that benchmark, `Sampson` (the
+answer) appears in **0 of 236** searches and Arkansas is scoped for a marriage in
+**0 of 30**.
+
+The genealogy under (b), stated one-sided on purpose: a woman who married more
+than once **may** appear on any record — including her own marriage records —
+under a former husband's surname. So a bride's surname on a marriage record is
+not by itself proof of her birth name, and records from earlier in her life are
+the ones likelier to predate her marriages.
+
+The stronger form — *a bride's surname is her birth name **only if** that
+marriage was her first* — was drafted and is **false**. The `jimmie-jewel-neal`
+fixture refutes it with its own answer record: the fixture states that `Wood`
+came from a marriage predating the 1875 one, so 1875 was not her first, and she
+is indexed on it under her birth surname anyway. A biconditional would also have
+instructed an agent to distrust the single record that carries the answer. The
+note must not assert it, and a test pins its absence.
+
+Two further things the (b) note must carry, because a place alone cannot reach an
+earlier marriage. The date window is sent upstream as a query constraint, so the
+note names the year to start before — computed from the offered candidates, not
+asserted. And the offered place may be a **county** while the record sits in a
+neighbouring county of the same state, so the note says to try the containing
+state as well. Its ordering is stated as closeness to the window and explicitly
+**not** a ranking of likelihood: a childhood residence is a family locality, not
+a wedding venue.
+
+`<= windowStart` is deliberately **narrower** than the ranker's own top bucket,
+which admits `year <= windowEnd` and gives in-window years a negative key so they
+sort first. A place they were *during* this window is evidence about this
+marriage, not evidence that an earlier one exists somewhere else. `<=` rather
+than `<` so a fact dated exactly at the window's start counts, matching the
+ranker's `windowStart - year >= 0` boundary.
+
+**Reason (b) is not self-limiting, and that is deliberate.** Replayed against
+`eval/tests/e2e/jimmie-jewel-neal/starting-tree.gedcomx.json`, it fires on **6 of
+6** eligible searches with 3 candidates each. Any couple with dated birthplaces
+has a pre-window place, so on the eligible path it is close to unconditional —
+searching their earliest known place does not quiet it either. And `samePlace`
+excludes only the place named on *this* call (the tool holds no cross-call
+state), so an agent that follows a hint gets another one, possibly re-offering
+somewhere it already searched. What is bounded is the hint's **size** — the
+at-or-before subset, capped at 8 — and the no-window path. Frequency is the
+point: the defect being fixed is that the feature almost never spoke.
 
 The sub-country condition matters more than it sounds. A country-wide nil means
 the record is not in that country's indexed collections, so naming counties inside
 it is noise — and an unscoped search never missed anywhere at all, which makes the
-note's "did not find the subject in the place searched" simply untrue. Both are the
-same situation and both are suppressed. Across the six committed `jimmie-jewel-neal`
+not-found note's "did not find the subject in the place searched" simply untrue.
+(Only reason (a) makes that claim; (b)'s note does not. The first half of the
+reason — localities inside the search are noise — carries the gate on both.)
+Both are the same situation and both are suppressed. Across the six committed `jimmie-jewel-neal`
 runlogs, **9 of 26** marriage-scoped searches carried no place scope whatsoever, so
 this is the common shape, not an edge case.
 
@@ -390,30 +464,51 @@ information is precisely why you are stuck. A spouse's places are exactly the
 borrowed context that unsticks it. Distinguishing them later wants an explicit
 field on `RankSearchMatchesResult`, not sniffing the `diagnostic` string.
 
-A nil-**only** trigger was tried first and is too narrow: in one verification run
-it fired once, at 121 of 180 minutes. Note that both triggers need `subjectId`, so
-a caller that omits it gets neither the hint nor host-side ranking — measured
-`subjectId` coverage across the six graded runs is **59 of 171 calls (34.5%)**:
-0% / 0% / 0% / 100% / 55% / 39%. That bounds how often either can fire at all. Do
-not read a run with low coverage as evidence about the trigger width.
+### Trigger width: the history, and why (b) was added
 
-**The trigger width has not been re-evaluated since, and is still owed a run.**
-Widening from nil-only to `nil || subjectResolvable === false` was decided against
-`run-2026-07-30_23-05-46`, which carried 55% coverage — so the binding constraint
-in that run was reachability, not width. The verification run that followed
-(`run-2026-07-31_13-02-13`) fired the hint **0 times**: 6 of its 7 marriage
-searches omitted `subjectId`, and the one that supplied it found its subject, so
-the trigger correctly stayed quiet. That run is therefore evidence about coverage
-and no evidence at all about width. `rankingSkipped` is the nudge aimed at
-coverage; once a run lands with materially higher coverage, re-read this section
-and check whether the wider trigger now fires too often. Until then, treat the
-width as untested rather than settled.
+A nil-**only** trigger was tried first and is too narrow: in one verification run
+it fired once, at 121 of 180 minutes. Widening to
+`nil || subjectResolvable === false` came next.
+
+Every trigger needs `subjectId`, so a caller that omits it gets neither the hint
+nor host-side ranking. Measured coverage across the six graded runs is **59 of
+171 calls (34.5%)**: 0% / 0% / 0% / 100% / 55% / 39%. That bounds how often any of
+them can fire. **Do not read a run with low coverage as evidence about width.**
+
+Coverage was then attacked directly, with `rankingSkipped` as an in-band nudge.
+**That did not work, and the result is worth keeping:** in
+`run-2026-08-05_10-31-31` (untracked, ungraded) `rankingSkipped` fired on
+**46 of 46** eligible calls and `subjectId` coverage came out at **19 of 65
+(29.2%)** — below the 34.5% pooled baseline. Per-run baseline was 0/0/0/100/55/39,
+so a single run cannot separate that from variance; what it does rule out is any
+expectation that telling the model to pass `subjectId` will fix reachability.
+**A fix that depends on the model supplying `subjectId` should not be attempted
+again without new evidence.**
+
+That left width as the only lever, and reason **(b)** is the answer to the
+question this section previously left open. What settled it: on
+`run-2026-07-31_13-02-13`, the only run built with the full (a) trigger, the
+single eligible search *found its subject*, so (a) correctly stayed quiet — and
+that search was the one search in seven runs that could have reached the answer.
+Replayed over every `subjectId`-carrying, sub-country-scoped marriage search in
+all seven runs, against the fixture's starting tree: **(a) alone fires on 4 of 6,
+(a) or (b) fires on 6 of 6**, and all 6 offer the husband's birth state. The delta
+is 2, and both are searches where ranking *succeeded* — the failure mode (a) is
+blind to by construction.
+
+Width is therefore no longer the open question. The open question is **ordering**:
+on that fixture the top candidate is Blount, Alabama (1860), ranked above Yell,
+Arkansas (1857) because it sits closer to the window, and there is one measured
+precedent for a wrong top candidate costing nine searches to one — see the
+ordering rationale on `marriageJurisdictionCandidates`. If a run comes back
+having followed the top candidate and ignored the rest, that is the ordering
+problem, not this trigger.
 
 | Field | Type | Description |
 |-------|------|-------------|
 | `searchedPlace` | string | Echo of the place actually searched: `marriagePlace` when given, otherwise `recordSubdivision` + `recordCountry` joined (see "Place matching"). Never absent — `isSubCountryPlace()` gates the hint and returns `false` for `undefined`, so the hint cannot exist without a place. |
-| `candidates` | JurisdictionCandidate[] | Other places these people are on record as having been, ordered by distance from the search's date window (see below). **Capped at 8** — the tail of a distance-ordered list is its least useful part, and this lands in a response whose assembly elsewhere strips `gedcomx` and hoists `collectionTitle` for context economy. The jurisdiction already searched is excluded, including differently-spelled and **narrower** forms of it; a **broader** place is kept, since a wider search reaches the other localities inside it. |
-| `note` | string | Plain-language statement of the rule, so the reason travels with the data — including that these are places to look, never evidence. |
+| `candidates` | JurisdictionCandidate[] | Places these people are on record as having been, ordered by distance from the search's date window (see below). **On reason (a), every such place. On reason (b), only those dated at or before `marriageYearFrom ?? marriageYearTo`** — a place reached later says nothing about whether an earlier marriage exists, which is the only question (b) asks. **Capped at 8** — the tail of a distance-ordered list is its least useful part, and this lands in a response whose assembly elsewhere strips `gedcomx` and hoists `collectionTitle` for context economy. The jurisdiction already searched is excluded, including differently-spelled and **narrower** forms of it; a **broader** place is kept, since a wider search reaches the other localities inside it. |
+| `note` | string | Plain-language statement of the rule, so the reason travels with the data — including that these are places to look, never evidence. **Two variants, selected by which reason fired.** (a) opens by saying the subject was not found in the place searched. (b) must not say that, because it is false there. (b) instead says a marriage found where a couple later lived is not necessarily their earliest, and that a bride's surname **may** be a former husband's so it is not by itself proof of her birth name — the one-sided form only; see the correction above. (b) also names the date range to widen to, and says to try the containing state, because a place alone cannot reach an earlier marriage. |
 
 Each `JurisdictionCandidate`: `place` (as written, `standard_place` preferred),
 `earliestYear` (number \| null), `whose` (the `persons[].id` that contributed the

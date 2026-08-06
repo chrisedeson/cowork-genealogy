@@ -860,7 +860,490 @@ describe("recordSearchTool — inline gedcomx omission when staged", () => {
   });
 });
 
-describe("recordSearchTool — jurisdiction hints on a nil marriage search", () => {
+// ─────────────────────────────────────────────────────────────────────────────
+// The hint's SECOND trigger: a marriage search that SUCCEEDED.
+//
+// Gating only on "did not find the subject" made the hint go quiet at the exact
+// moment the trap springs, because a marriage search aimed at the wrong
+// jurisdiction still succeeds there. Measured, from `run-2026-07-31_13-02-13`:
+// a groom-anchored search of Hill County, Texas for 1878-1884 returned "James M
+// Neal and Mattie Landham" at matchConfidence 5, ranking resolved the subject,
+// and the hint stayed silent — while the record naming the bride's birth surname
+// is an 1875 marriage in Nevada County, Arkansas, the husband's birth state,
+// already present in the same tree. Finding A marriage is not finding the
+// EARLIEST one, and only the earliest carries a bride's birth surname (#1189).
+//
+// Every test here supplies a marriageYear window, which is what the old tests
+// below never do — that is precisely why all nine of them keep passing unchanged.
+describe("recordSearchTool — jurisdiction hints when the marriage search FOUND records", () => {
+  let dir: string;
+
+  // The `jimmie-jewel-neal` shape, reduced: the husband's birth state is the
+  // answer's jurisdiction and only he carries it; the wife carries the later
+  // residence the compiled tree points at, plus one clearly post-window place.
+  const TREE = {
+    persons: [
+      {
+        id: "I1",
+        names: [{ given: "James", surname: "Neal" }],
+        facts: [
+          {
+            type: "Birth",
+            date: "1857",
+            standard_date: "1857",
+            place: "Yell, Arkansas, United States",
+            standard_place: "Yell, Arkansas, United States",
+          },
+        ],
+      },
+      {
+        id: "I2",
+        names: [{ given: "Martha", surname: "Wood" }],
+        facts: [
+          {
+            type: "Birth",
+            date: "1855",
+            standard_date: "1855",
+            place: "Georgia, United States",
+            standard_place: "Georgia, United States",
+          },
+          {
+            type: "Residence",
+            date: "1860",
+            standard_date: "1860",
+            place: "Blount, Alabama, United States",
+            standard_place: "Blount, Alabama, United States",
+          },
+          {
+            type: "Death",
+            date: "1906",
+            standard_date: "1906",
+            place: "Carlsbad, Eddy, New Mexico, United States",
+            standard_place: "Carlsbad, Eddy, New Mexico, United States",
+          },
+        ],
+      },
+    ],
+    relationships: [
+      { id: "R1", type: "Couple", person1: "I1", person2: "I2", facts: [] },
+    ],
+  };
+
+  /**
+   * Search returns rows AND ranking resolves the subject — the case the old
+   * trigger treated as "nothing to say". Dispatches on URL because one mock
+   * serves both the search and the per-candidate matchTwoExamples scoring; a
+   * score above `DEGENERATE_FLOOR` (0.01) is what keeps `subjectResolvable`
+   * from being set to false.
+   */
+  function mockFoundAndScored(): void {
+    mockFetch.mockImplementation(async (url: string) => {
+      if (String(url).includes("matchTwoExamples")) {
+        return makeOkResponse({
+          title: "ark:/61903/1:1:QPRC-WPBZ",
+          updated: 0,
+          entries: [{ id: "p_1", score: 0.85, confidence: 5 }],
+        } as unknown as FSSearchResponse);
+      }
+      return makeOkResponse({
+        results: 1,
+        index: 0,
+        entries: [lincolnEntry()],
+      });
+    });
+  }
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), "record-search-juris-found-"));
+    await writeFile(
+      join(dir, "tree.gedcomx.json"),
+      JSON.stringify(TREE),
+      "utf-8",
+    );
+  });
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it("fires when the search found the subject but the tree knows an earlier place", async () => {
+    mockFoundAndScored();
+
+    const out = await recordSearchTool({
+      surname: "Neal",
+      givenName: "James",
+      recordType: "marriage",
+      marriagePlace: "Hill County, Texas",
+      marriageYearFrom: 1878,
+      marriageYearTo: 1884,
+      projectPath: dir,
+      subjectId: "I1",
+    });
+
+    // The precondition that makes this test mean anything: the old trigger is
+    // false here. Without it a regression could satisfy the assertion below by
+    // making the search fail instead.
+    expect(out.totalMatches).toBeGreaterThan(0);
+    expect(out.ranked?.subjectResolvable).not.toBe(false);
+
+    expect(out.jurisdictionHints).toBeDefined();
+    const places = out.jurisdictionHints?.candidates.map((c) => c.place) ?? [];
+    expect(places).toContain("Yell, Arkansas, United States");
+  });
+
+  it("offers only places at or before the window, never later ones", async () => {
+    mockFoundAndScored();
+
+    const out = await recordSearchTool({
+      surname: "Neal",
+      givenName: "James",
+      recordType: "marriage",
+      marriagePlace: "Hill County, Texas",
+      marriageYearFrom: 1878,
+      marriageYearTo: 1884,
+      projectPath: dir,
+      subjectId: "I1",
+    });
+
+    const places = out.jurisdictionHints?.candidates.map((c) => c.place) ?? [];
+    expect(places).toEqual(
+      expect.arrayContaining([
+        "Yell, Arkansas, United States",
+        "Georgia, United States",
+        "Blount, Alabama, United States",
+      ]),
+    );
+    // 1906 is 22 years after the window closes. A place they reached later says
+    // nothing about whether an EARLIER marriage exists, which is the only
+    // question this branch is asking.
+    expect(places).not.toContain("Carlsbad, Eddy, New Mexico, United States");
+    for (const c of out.jurisdictionHints?.candidates ?? []) {
+      expect(c.earliestYear).not.toBeNull();
+      expect(c.earliestYear as number).toBeLessThanOrEqual(1878);
+    }
+  });
+
+  it("says why, rather than claiming the search failed", async () => {
+    mockFoundAndScored();
+
+    const out = await recordSearchTool({
+      surname: "Neal",
+      givenName: "James",
+      recordType: "marriage",
+      marriagePlace: "Hill County, Texas",
+      marriageYearFrom: 1878,
+      marriageYearTo: 1884,
+      projectPath: dir,
+      subjectId: "I1",
+    });
+
+    const note = out.jurisdictionHints?.note ?? "";
+    // The other note opens by asserting the search did not find the subject. On
+    // this branch it did, so sending that wording would be a false statement in
+    // the tool's own response.
+    expect(note).not.toContain("did not find the subject");
+
+    // Regression guard on a claim that was written, shipped in review, and
+    // falsified. An earlier draft said a bride's surname is her birth name
+    // "ONLY if that marriage was her first". `jimmie-jewel-neal`'s own answer
+    // record refutes it: the fixture states the 1875 marriage was NOT her first
+    // and she is indexed on it under her birth surname anyway. Worse, the
+    // biconditional would tell an agent to distrust the single record that
+    // carries the answer. Only the one-sided claim may ship.
+    expect(note).not.toContain("ONLY if");
+    expect(note).not.toContain("her first");
+    expect(note).toContain("not by itself proof of her birth name");
+  });
+
+  it("tells the caller to move the date range back, and names the year", async () => {
+    mockFoundAndScored();
+
+    const out = await recordSearchTool({
+      surname: "Neal",
+      givenName: "James",
+      recordType: "marriage",
+      marriagePlace: "Hill County, Texas",
+      marriageYearFrom: 1878,
+      marriageYearTo: 1884,
+      projectPath: dir,
+      subjectId: "I1",
+    });
+
+    const note = out.jurisdictionHints?.note ?? "";
+    // A place alone cannot reach an earlier marriage: the window is sent
+    // upstream as a query constraint, so an agent that re-searches Yell,
+    // Arkansas for 1878-1884 is still in the wrong decade. The benchmark's
+    // answer record is an 1875 marriage, which that range excludes.
+    expect(note).toContain("widen the date range");
+    // Both ends are real: earliest shown (Georgia, 1855) to the window's start.
+    expect(note).toContain("1855 to 1878");
+    // A county-scoped search does not reach a neighbouring county: the tree
+    // offers Yell County while the answer sits in Nevada County, same state.
+    expect(note).toContain("containing state");
+  });
+
+  it("treats the window's START as the boundary, inclusively", async () => {
+    mockFoundAndScored();
+    await writeFile(
+      join(dir, "tree.gedcomx.json"),
+      JSON.stringify({
+        persons: [
+          {
+            id: "I1",
+            names: [{ given: "James", surname: "Neal" }],
+            facts: [
+              {
+                type: "Residence",
+                date: "1878",
+                standard_date: "1878",
+                place: "Onboundary, Kentucky, United States",
+                standard_place: "Onboundary, Kentucky, United States",
+              },
+              {
+                type: "Residence",
+                date: "1881",
+                standard_date: "1881",
+                place: "Insidewindow, Ohio, United States",
+                standard_place: "Insidewindow, Ohio, United States",
+              },
+            ],
+          },
+        ],
+        relationships: [],
+      }),
+      "utf-8",
+    );
+
+    const out = await recordSearchTool({
+      surname: "Neal",
+      givenName: "James",
+      recordType: "marriage",
+      marriagePlace: "Hill County, Texas",
+      marriageYearFrom: 1878,
+      marriageYearTo: 1884,
+      projectPath: dir,
+      subjectId: "I1",
+    });
+
+    const places = out.jurisdictionHints?.candidates.map((c) => c.place) ?? [];
+    // `<=` not `<`: a fact dated exactly at the window's start still names a
+    // place an earlier marriage could have been filed.
+    expect(places).toContain("Onboundary, Kentucky, United States");
+    // `windowStart` not `windowEnd`: a place they reached DURING this window is
+    // evidence about this marriage, not about an earlier one. The ranker's own
+    // top bucket admits `<= windowEnd` and would keep this; the filter is
+    // deliberately narrower.
+    expect(places).not.toContain("Insidewindow, Ohio, United States");
+  });
+
+  it("offers an undated place rather than dropping it", async () => {
+    mockFoundAndScored();
+    await writeFile(
+      join(dir, "tree.gedcomx.json"),
+      JSON.stringify({
+        persons: [
+          {
+            id: "I1",
+            names: [{ given: "James", surname: "Neal" }],
+            facts: [
+              {
+                type: "Residence",
+                place: "Yell, Arkansas, United States",
+                standard_place: "Yell, Arkansas, United States",
+              },
+            ],
+          },
+        ],
+        relationships: [],
+      }),
+      "utf-8",
+    );
+
+    const out = await recordSearchTool({
+      surname: "Neal",
+      givenName: "James",
+      recordType: "marriage",
+      marriagePlace: "Hill County, Texas",
+      marriageYearFrom: 1878,
+      marriageYearTo: 1884,
+      projectPath: dir,
+      subjectId: "I1",
+    });
+
+    // The ranker deliberately ranks undated ABOVE post-window places, on the
+    // reasoning that an undated residence still says these people were there.
+    // Dropping them here would invert that, and would mean a tree whose facts
+    // are all undated — the thin compiled trees this targets — could never fire
+    // this branch at all.
+    const places = out.jurisdictionHints?.candidates.map((c) => c.place) ?? [];
+    expect(places).toContain("Yell, Arkansas, United States");
+    // With nothing dated, the note cannot name a range start and must not
+    // fabricate one.
+    expect(out.jurisdictionHints?.note).toContain("well before 1878");
+  });
+
+  it("builds the note from the capped list it ships, not the list before the cap", async () => {
+    mockFoundAndScored();
+    // Eleven pre-window places. The ranker sorts most-recent-first, so the
+    // EARLIEST is last and is the first thing the cap removes — which is how an
+    // earlier version came to quote a year absent from the list it pointed at.
+    const facts = [];
+    for (let year = 1877; year >= 1867; year--) {
+      facts.push({
+        type: "Residence",
+        date: String(year),
+        standard_date: String(year),
+        place: `Place${year}, Kentucky, United States`,
+        standard_place: `Place${year}, Kentucky, United States`,
+      });
+    }
+    await writeFile(
+      join(dir, "tree.gedcomx.json"),
+      JSON.stringify({
+        persons: [
+          { id: "I1", names: [{ given: "James", surname: "Neal" }], facts },
+        ],
+        relationships: [],
+      }),
+      "utf-8",
+    );
+
+    const out = await recordSearchTool({
+      surname: "Neal",
+      givenName: "James",
+      recordType: "marriage",
+      marriagePlace: "Hill County, Texas",
+      marriageYearFrom: 1878,
+      marriageYearTo: 1884,
+      projectPath: dir,
+      subjectId: "I1",
+    });
+
+    const cands = out.jurisdictionHints?.candidates ?? [];
+    expect(cands.length).toBe(8);
+    const shownYears = cands.map((c) => c.earliestYear as number);
+    // The note's range start is the earliest year STILL SHOWN (1870)...
+    expect(out.jurisdictionHints?.note).toContain(
+      `${Math.min(...shownYears)} to 1878`,
+    );
+    expect(out.jurisdictionHints?.note).toContain("1870 to 1878");
+    // ...not the earliest the tree holds (1867), which the cap removed.
+    expect(out.jurisdictionHints?.note).not.toContain("1867");
+  });
+
+  it("stays silent on a found marriage when nothing in the tree predates the window", async () => {
+    mockFoundAndScored();
+    await writeFile(
+      join(dir, "tree.gedcomx.json"),
+      JSON.stringify({
+        persons: [
+          {
+            id: "I1",
+            names: [{ given: "James", surname: "Neal" }],
+            facts: [
+              {
+                type: "Residence",
+                date: "1900",
+                standard_date: "1900",
+                place: "Cottle, Texas, United States",
+                standard_place: "Cottle, Texas, United States",
+              },
+            ],
+          },
+        ],
+        relationships: [],
+      }),
+      "utf-8",
+    );
+
+    const out = await recordSearchTool({
+      surname: "Neal",
+      givenName: "James",
+      recordType: "marriage",
+      marriagePlace: "Hill County, Texas",
+      marriageYearFrom: 1878,
+      marriageYearTo: 1884,
+      projectPath: dir,
+      subjectId: "I1",
+    });
+
+    expect(out.jurisdictionHints).toBeUndefined();
+  });
+
+  it("stays silent on a found marriage with no year window, exactly as before", async () => {
+    mockFoundAndScored();
+
+    const out = await recordSearchTool({
+      surname: "Neal",
+      givenName: "James",
+      recordType: "marriage",
+      marriagePlace: "Hill County, Texas",
+      projectPath: dir,
+      subjectId: "I1",
+    });
+
+    // No window means no proximity signal, so there is no "earlier" to speak of.
+    // This is the 6-of-30 shape in the runlogs and it must not change.
+    expect(out.jurisdictionHints).toBeUndefined();
+  });
+
+  it("serializes the hint BEFORE results, so a long array cannot bury it", async () => {
+    mockFoundAndScored();
+
+    const out = await recordSearchTool({
+      surname: "Neal",
+      givenName: "James",
+      recordType: "marriage",
+      marriagePlace: "Hill County, Texas",
+      marriageYearFrom: 1878,
+      marriageYearTo: 1884,
+      projectPath: dir,
+      subjectId: "I1",
+    });
+
+    const keys = Object.keys(out);
+    expect(keys).toContain("jurisdictionHints");
+    expect(keys.indexOf("jurisdictionHints")).toBeLessThan(
+      keys.indexOf("results"),
+    );
+    // The reorder rebuilds the response, so pin that it drops nothing. Reason
+    // (b) fires only on searches that returned rows, which is exactly when
+    // `results` is long enough to bury a trailing field.
+    expect(out.totalMatches).toBe(1);
+    expect(out.results.length).toBe(1);
+    expect(out.query).toBeDefined();
+    expect(out.staged).toBeDefined();
+    expect(out.ranked).toBeDefined();
+  });
+
+  it("keeps the whole ranked list and the original note when the search found nobody", async () => {
+    mockFetch.mockResolvedValue(
+      makeOkResponse({ results: 0, index: 0, entries: [] }),
+    );
+
+    const out = await recordSearchTool({
+      surname: "Neal",
+      givenName: "James",
+      recordType: "marriage",
+      marriagePlace: "Hill County, Texas",
+      marriageYearFrom: 1878,
+      marriageYearTo: 1884,
+      projectPath: dir,
+      subjectId: "I1",
+    });
+
+    // Branch (a) is untouched: a nil search still gets every place, including
+    // the post-window one that branch (b) filters out, and the note that says
+    // the subject was not found here.
+    const places = out.jurisdictionHints?.candidates.map((c) => c.place) ?? [];
+    expect(places).toContain("Carlsbad, Eddy, New Mexico, United States");
+    expect(out.jurisdictionHints?.note).toContain("did not find the subject");
+  });
+});
+
+// Reason (a): the search did not find the subject. None of these supplies a
+// marriageYear window, so reason (b) cannot fire in any of them and every verdict
+// here is about (a) alone — which is why they are unchanged by (b)'s addition.
+describe("recordSearchTool — jurisdiction hints when the marriage search did NOT find the subject", () => {
   let dir: string;
 
   // A couple who married in one place and later lived in another. The decisive

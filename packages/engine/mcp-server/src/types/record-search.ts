@@ -287,15 +287,39 @@ export interface RecordSearchToolResponse {
   staged?: { resultsRef: string; returnedCount: number } | null;
   // Set only when staging was attempted and failed — the search still succeeded.
   stagingError?: string;
-  // Present only on a marriage search that did not find the subject — no hits, or
-  // ranking reporting `subjectResolvable: false` — made with `projectPath` +
-  // `subjectId`, and scoped to something narrower than a country. Carries the
-  // other jurisdictions these people are on record as having been, ordered by
-  // distance from the search's own marriage date window (NOT earliest-first; that
-  // ordering was measured harmful, see the spec). A marriage is filed where the
-  // wedding happened, not where the couple later lived, so a miss in one place is
-  // a prompt to try the others, not a finding. Advisory only; nothing downstream
-  // depends on it.
+  // Present on a marriage search made with `projectPath` + `subjectId` and scoped
+  // to something narrower than a country, for either of TWO reasons:
+  //
+  //   (a) it did not find the subject — no hits, or ranking reporting
+  //       `subjectResolvable: false`. Carries every other jurisdiction these
+  //       people are on record as having been, ordered by distance from the
+  //       search's own marriage date window (NOT earliest-first; that ordering
+  //       was measured harmful, see the spec). A marriage is filed where the
+  //       wedding happened, not where the couple later lived, so a miss in one
+  //       place is a prompt to try the others, not a finding.
+  //
+  //   (b) it was NOT judged to have missed the subject, and the tree holds a
+  //       placed fact for these people dated at or before this search's window
+  //       (or undated). Carries only those places — one dated after the window
+  //       says nothing about whether an earlier marriage exists.
+  //
+  //       Deliberately weaker than "it found the subject": when staging or
+  //       ranking did not run, `ranked` is absent and nothing established either
+  //       way. The note only claims the search returned records, which is true
+  //       in every case reaching this branch.
+  //
+  //       The genealogy is stated ONE-SIDED on purpose. A woman who married more
+  //       than once MAY appear on any record — including her own marriage
+  //       records — under a former husband's surname, so a bride's surname is
+  //       not by itself proof of her birth name. The stronger "…her birth name
+  //       only if that marriage was her first" is FALSE and must not be
+  //       reintroduced: `jimmie-jewel-neal`'s answer record is a marriage the
+  //       fixture states was not her first, on which she is indexed under her
+  //       birth surname anyway. A test pins the absence of that wording.
+  //
+  // Requires a `marriageYearFrom`/`marriageYearTo` window for (b): with no
+  // window there is no proximity signal and only (a) can fire. `note` says which
+  // reason applied. Advisory only; nothing downstream depends on it.
   jurisdictionHints?: {
     // Required, not optional: `isSubCountryPlace()` gates the hint and returns
     // false for `undefined`, so a hint without a searched place cannot exist.

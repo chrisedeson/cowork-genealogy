@@ -13,6 +13,11 @@ import { earliestYear } from "./date-helpers.js";
  * lived. So when a marriage search comes back empty in one place, the other
  * places these people are known to have been are worth trying.
  *
+ * This function only computes and ranks the candidates; `record-search.ts`
+ * decides when to offer them, and does so for two reasons — a search that did
+ * not find the subject, and a search that DID but has at-or-before places it
+ * never tried. See `jurisdictionHints` in `record-search-tool-spec-v2.md`.
+ *
  * This exists because the alternative is asking the model to remember it on
  * every search, which it does not do: across four scored runs of the
  * `jimmie-jewel-neal` benchmark every marriage search stayed in the family's
@@ -100,7 +105,10 @@ function placeParts(place: string): string[] {
  * The hint is gated on this. A search scoped to a country, or scoped to nothing
  * at all, is not a search that missed *somewhere* — every candidate the tree can
  * offer was already inside it, so naming localities within it is noise, and the
- * note's "did not find the subject in the place searched" would be false.
+ * not-found note's "did not find the subject in the place searched" would be
+ * false. (Only that note makes the claim; the found-records note does not. The
+ * first half of the reason — naming localities already inside the search is
+ * noise — is what carries the gate on both branches.)
  *
  * Exported rather than duplicating the country set into `record-search.ts`,
  * because `placeTokens` below deliberately collapses the distinction this

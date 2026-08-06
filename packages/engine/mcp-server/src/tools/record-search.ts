@@ -30,6 +30,7 @@ import {
   isSubCountryPlace,
   marriageJurisdictionCandidates,
 } from "../utils/marriage-jurisdictions.js";
+import type { JurisdictionCandidate } from "../utils/marriage-jurisdictions.js";
 import { rankSearchMatches } from "./rank-search-matches.js";
 
 // Re-exported so existing importers (and tests) keep resolving it here.
@@ -39,8 +40,89 @@ const FS_SEARCH_URL =
   "https://www.familysearch.org/service/search/hr/v2/personas";
 
 const PAGINATION_CAP = 4999;
-/** Most jurisdiction candidates a nil marriage search will offer. See below. */
+/** Most jurisdiction candidates a marriage search will offer. See below. */
 const MAX_JURISDICTION_HINTS = 8;
+
+/** Shared tail of both jurisdiction notes: what the list is, and what it is not. */
+const JURISDICTION_NOTE_TAIL =
+  "These are places to LOOK, not evidence of anything: a jurisdiction " +
+  "appearing here is not a reason to attach a person found there. Each entry " +
+  "says whose fact it came from and when, because a place contributed by a " +
+  "spouse from a much later marriage may have no bearing on this one.";
+
+/**
+ * Sent when the search did not find the subject in the place it searched.
+ *
+ * The ordering sentence covers BOTH orderings the ranker produces. It used to
+ * describe only the windowed one ("most recent before the window first… undated
+ * next… after the window last"), which is false with no window — `rankKey` then
+ * falls back to earliest-first with undated LAST. Every one of this branch's
+ * pre-existing tests supplies no window, so all of them were receiving that
+ * false claim and none could notice.
+ */
+const JURISDICTION_NOTE_NOT_FOUND =
+  "This marriage search did not find the subject in the place searched. A " +
+  "marriage is filed where the wedding happened, not where the couple later " +
+  "lived, and a couple usually married BEFORE they migrated. Listed below are " +
+  "other places these people are on record as having been. When this search " +
+  "gave a date window they are ordered by closeness to it — most recent BEFORE " +
+  "the window first, since that is the best guess for where they were when " +
+  "they married, then undated places, then places dated after it. With no date " +
+  "window there is no such signal and they are ordered earliest first. Search " +
+  "these before concluding no marriage record exists. " +
+  JURISDICTION_NOTE_TAIL;
+
+/**
+ * Sent when the search DID find a marriage here.
+ *
+ * Deliberately does not claim the search failed — it did not.
+ *
+ * Every claim here is one-sided on purpose. An earlier draft said a bride's
+ * surname is her birth name "ONLY if that marriage was her first", and this
+ * repo's own `jimmie-jewel-neal` fixture falsifies that: its answer record is an
+ * 1875 marriage that the fixture states was NOT her first, and she is indexed on
+ * it under her birth surname regardless. A biconditional would also have told an
+ * agent to distrust the one record that carries the answer. What is safely true
+ * is the negative — a bride surname MAY be a former husband's — plus the reason
+ * to look earlier, which is that earlier records are likelier to predate her
+ * marriages.
+ *
+ * Takes the SHOWN list (already capped) and the window start, because two of its
+ * instructions need real numbers: an earlier marriage needs an earlier DATE
+ * RANGE, not just another place. Computing over the uncapped list would be a
+ * silent lie — the ranker sorts most-recent-first, so the earliest entry is
+ * always last and is always the first thing the cap removes, which made the note
+ * name a year guaranteed to be absent from the list it points at.
+ */
+function jurisdictionNoteEarlier(
+  shown: JurisdictionCandidate[],
+  windowStart: number,
+): string {
+  const years = shown
+    .map((c) => c.earliestYear)
+    .filter((y): y is number => y !== null);
+  const range =
+    years.length > 0
+      ? `widen the date range to cover ${Math.min(...years)} to ${windowStart}`
+      : `widen the date range to start well before ${windowStart}`;
+  return (
+    "This marriage search found records, but a marriage found where a couple " +
+    "later lived is not necessarily their earliest. A woman who married more " +
+    "than once may appear on any record — including her own marriage records — " +
+    "under a former husband's surname, so a bride's surname here is not by " +
+    "itself proof of her birth name. Records from earlier in her life are the " +
+    "ones likelier to predate her marriages. Listed below are places these " +
+    "people are on record as having been at or before this search's date " +
+    "window, or on records this tree cannot date: the family's earlier " +
+    "localities, where earlier records are most likely filed. A place alone " +
+    `will not reach them — you must ALSO ${range}. And search the containing ` +
+    "state as well as the locality named, since a neighbouring county does not " +
+    "match a county-scoped search. Ordered by closeness to this window, which " +
+    "is NOT a ranking of likelihood — a childhood residence is a family " +
+    "locality, not a wedding venue. " +
+    JURISDICTION_NOTE_TAIL
+  );
+}
 /**
  * Emitted on every `projectPath`-carrying search that names no subject — 112 of
  * the 171 calls (65.5%) across the six committed `jimmie-jewel-neal` runlogs, the
@@ -720,14 +802,26 @@ export async function recordSearchTool(
   // present in the same tree. Computing the alternatives is date arithmetic over
   // places the tree already holds, so the tool does it instead of asking.
   //
-  // Fires on a search that did not find the subject here — either literally no
-  // hits, or hits that ranking judged to hold no match (`subjectResolvable`
-  // false). The ranker sets that in TWO branches — a scoreable subject against a
-  // pool with no match, and a subject too thin to discriminate — and the hint
-  // fires on both deliberately; see the spec's `subjectResolvable` paragraph.
-  // Nil-only was too narrow: in one verification run it fired once, at 121 of 180
-  // minutes. A search that returned rows but matched nobody is an equally good
-  // moment to offer the alternative.
+  // Fires on TWO disjoint reasons, and the second is the one that matters here.
+  //
+  // (a) The search did not find the subject — either literally no hits, or hits
+  // that ranking judged to hold no match (`subjectResolvable` false). The ranker
+  // sets that in TWO branches — a scoreable subject against a pool with no match,
+  // and a subject too thin to discriminate — and the hint fires on both
+  // deliberately; see the spec's `subjectResolvable` paragraph. Nil-only was too
+  // narrow: in one verification run it fired once, at 121 of 180 minutes.
+  //
+  // (b) The search DID find the subject, but the tree knows somewhere these
+  // people were at or before this window. Gating only on (a) meant the hint went
+  // quiet at the exact moment the trap springs, because a marriage search aimed
+  // at the wrong jurisdiction still succeeds there. The measured case, from
+  // `run-2026-07-31_13-02-13`: a groom-anchored search of Hill County, Texas for
+  // 1878-1884 returned "James M Neal and Mattie Landham" at matchConfidence 5,
+  // ranking resolved the subject, the hint stayed silent — and the record that
+  // names the bride's birth surname is an 1875 marriage in Nevada County,
+  // Arkansas, the husband's birth state, already in the same tree. Finding A
+  // marriage is not finding the EARLIEST one, and only the earliest carries a
+  // bride's birth surname (#1189).
   //
   // Also gated on the search having been scoped to something NARROWER THAN A
   // COUNTRY. Unscoped and country-wide are the same situation: every candidate
@@ -758,9 +852,13 @@ export async function recordSearchTool(
     [input.recordSubdivision, input.recordCountry].filter(Boolean).join(", ") ||
     undefined;
 
+  // Same derivation as `marriageJurisdictionCandidates`'s own `windowStart`, so
+  // the filter below and the ranker can never disagree about which window they
+  // are talking about.
+  const windowStart = input.marriageYearFrom ?? input.marriageYearTo;
+
   if (
     isMarriageSearch &&
-    foundNobody &&
     // Explicit, rather than leaning on `isSubCountryPlace` to narrow: that
     // predicate is intentionally not a type guard (see its comment), and this is
     // what makes `jurisdictionHints.searchedPlace` a sound required `string`.
@@ -776,32 +874,75 @@ export async function recordSearchTool(
         marriageYearFrom: input.marriageYearFrom,
         marriageYearTo: input.marriageYearTo,
       });
-      if (candidates.length > 0) {
+
+      // Reason (b). `<= windowStart` is deliberately NARROWER than the ranker's
+      // top bucket, which admits `year <= windowEnd` and gives in-window years a
+      // negative key so they sort first. A place they were *during* this window
+      // is evidence about this marriage, not evidence that an earlier one exists
+      // somewhere else. `<=` rather than `<` so a fact dated exactly at the
+      // window's start counts, matching the ranker's `windowStart - year >= 0`.
+      //
+      // No window means no proximity signal and so no "earlier" to speak of;
+      // the search then behaves exactly as it did before this branch existed.
+      //
+      // Undated candidates are INCLUDED, deliberately. `rankKey` already ranks
+      // undated above post-window places on the reasoning that an undated
+      // residence still says these people were there; excluding them here would
+      // invert that, and would mean a tree whose facts are all undated — the
+      // thin compiled trees this feature targets — could never fire (b) at all.
+      // The note says "or on records this tree cannot date" rather than
+      // claiming they are known to predate the window.
+      const earlier =
+        windowStart === undefined
+          ? []
+          : candidates.filter(
+              (c) => c.earliestYear === null || c.earliestYear <= windowStart,
+            );
+
+      // On (a) the whole ranked list is useful — the subject is not here, so
+      // anywhere else is a lead. On (b) only the earlier places are: a place
+      // dated after this window says nothing about whether a prior marriage
+      // exists, and offering it would point away from the question.
+      const offered = foundNobody ? candidates : earlier;
+
+      // Capped: 4 spouses x 8 placed facts is 40 objects, and this lands in a
+      // response whose own assembly above deliberately strips `gedcomx`, hoists
+      // `collectionTitle` and drops empty `treeMatches` for context economy.
+      // The tail of a distance-ordered list is the least useful part of it.
+      //
+      // Sliced ONCE, and the note is built from the same list that ships. Two
+      // separate slices is how the note came to quote a year the cap had already
+      // removed.
+      const shown = offered.slice(0, MAX_JURISDICTION_HINTS);
+
+      if (shown.length > 0) {
         out.jurisdictionHints = {
           searchedPlace,
-          // Capped: 4 spouses x 8 placed facts is 40 objects, and this lands in a
-          // response whose own assembly above deliberately strips `gedcomx`, hoists
-          // `collectionTitle` and drops empty `treeMatches` for context economy.
-          // The tail of a distance-ordered list is the least useful part of it.
-          candidates: candidates.slice(0, MAX_JURISDICTION_HINTS),
+          candidates: shown,
           note:
-            "This marriage search did not find the subject in the place searched. A " +
-            "marriage is filed where the wedding happened, not where the couple later " +
-            "lived, and a couple usually married BEFORE they migrated. Listed below are " +
-            "other places these people are on record as having been, ordered by how " +
-            "close they sit to this search's date window — most recent BEFORE the " +
-            "window first, since that is the best guess for where they were when they " +
-            "married; undated places next; places dated after the window last. Search " +
-            "these before concluding no marriage record exists. " +
-            "These are places to LOOK, not evidence of anything: a jurisdiction " +
-            "appearing here is not a reason to attach a person found there. Each entry " +
-            "says whose fact it came from and when, because a place contributed by a " +
-            "spouse from a much later marriage may have no bearing on this one.",
+            foundNobody || windowStart === undefined
+              ? JURISDICTION_NOTE_NOT_FOUND
+              : jurisdictionNoteEarlier(shown, windowStart),
         };
       }
     } catch {
       // A missing or malformed tree is not a search failure. Stay silent.
     }
+  }
+
+  // Hoist the hint above `results`, for the reason `rankingSkipped` is hoisted
+  // above it in the assembly further up: `results` is by far the largest field,
+  // and a trailing advisory is the one that gets skimmed past. That mattered
+  // less when the hint only fired on a nil search, where `results` is empty —
+  // reason (b) fires only on searches that DID return rows, so it is now
+  // routinely the last key after a long array.
+  //
+  // Rebuild rather than mutate: string keys keep insertion order, so the only
+  // way to move one is to reinsert `results` last. The spread carries every
+  // other field untouched, in its existing order.
+  if (out.jurisdictionHints !== undefined) {
+    const { results: resultsTail, ...head } = out;
+    return { ...head, results: resultsTail };
   }
 
   return out;
