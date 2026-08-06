@@ -65,10 +65,10 @@ const JURISDICTION_NOTE_NOT_FOUND =
   "marriage is filed where the wedding happened, not where the couple later " +
   "lived, and a couple usually married BEFORE they migrated. Listed below are " +
   "other places these people are on record as having been. When this search " +
-  "gave a date window they are ordered by closeness to it — most recent BEFORE " +
-  "the window first, since that is the best guess for where they were when " +
-  "they married, then undated places, then places dated after it. With no date " +
-  "window there is no such signal and they are ordered earliest first. Search " +
+  "gave a date window they are ordered by closeness to it — places dated " +
+  "INSIDE the window first, then the most recent before it, then undated " +
+  "places, then places dated after it. With no date window there is no such " +
+  "signal and they are ordered earliest first. Search " +
   "these before concluding no marriage record exists. " +
   JURISDICTION_NOTE_TAIL;
 
@@ -97,14 +97,33 @@ const JURISDICTION_NOTE_NOT_FOUND =
 function jurisdictionNoteEarlier(
   shown: JurisdictionCandidate[],
   windowStart: number,
+  searchedPlace?: string,
 ): string {
+  // Guarded on both ends. A sole at-boundary fact yielded "cover 1878 to 1878",
+  // which instructs nothing, and an unclamped year from a malformed
+  // `standard_date` yielded "cover 44 to 1878". Only a plausible year strictly
+  // earlier than the window start can name a range.
   const years = shown
-    .map((c) => c.earliestYear)
-    .filter((y): y is number => y !== null);
+    .map((c) => c.earliestAtPlace)
+    .filter((y): y is number => y !== null && y >= 1000 && y < windowStart);
   const range =
     years.length > 0
       ? `widen the date range to cover ${Math.min(...years)} to ${windowStart}`
       : `widen the date range to start well before ${windowStart}`;
+  // Only worth saying when the search was scoped NARROWER than a state. Told to
+  // a search already scoped to "Arkansas", "try the containing state" names the
+  // place it just searched.
+  const scopedNarrowerThanState =
+    searchedPlace !== undefined &&
+    searchedPlace
+      .toLowerCase()
+      .split(",")
+      .map((x) => x.trim())
+      .filter((x) => x && !["united states", "usa", "us"].includes(x)).length > 1;
+  const stateAdvice = scopedNarrowerThanState
+    ? "And search the containing state as well as the locality named, since a " +
+      "neighbouring county does not match a county-scoped search. "
+    : "";
   return (
     "This marriage search found records, but a marriage found where a couple " +
     "later lived is not necessarily their earliest. A woman who married more " +
@@ -115,9 +134,8 @@ function jurisdictionNoteEarlier(
     "people are on record as having been at or before this search's date " +
     "window, or on records this tree cannot date: the family's earlier " +
     "localities, where earlier records are most likely filed. A place alone " +
-    `will not reach them — you must ALSO ${range}. And search the containing ` +
-    "state as well as the locality named, since a neighbouring county does not " +
-    "match a county-scoped search. Ordered by closeness to this window, which " +
+    `will not reach them — you must ALSO ${range}. ${stateAdvice}` +
+    "Ordered by closeness to this window, which " +
     "is NOT a ranking of likelihood — a childhood residence is a family " +
     "locality, not a wedding venue. " +
     JURISDICTION_NOTE_TAIL
@@ -838,8 +856,13 @@ export async function recordSearchTool(
     input.marriageYearFrom !== undefined ||
     input.marriageYearTo !== undefined;
 
+  // Keyed on the MAPPED rows, not `out.totalMatches`. A page whose every entry
+  // fails `mapEntry` (or an offset past the end) leaves `results: []` while the
+  // upstream total is non-zero — staging is skipped, ranking never runs, so
+  // `subjectResolvable` is absent and reason (b) would ship a note opening
+  // "This marriage search found records" on a response that returned none.
   const foundNobody =
-    out.totalMatches === 0 || out.ranked?.subjectResolvable === false;
+    out.results.length === 0 || out.ranked?.subjectResolvable === false;
 
   // The place that was just searched is not always `marriagePlace`. In practice
   // the caller usually scopes a marriage search with `recordCountry` +
@@ -847,10 +870,18 @@ export async function recordSearchTool(
   // another. Reading only `marriagePlace` left `searchedPlace` undefined on those,
   // so nothing was excluded and the jurisdiction that had just come back empty was
   // offered back as its own top alternative.
-  const searchedPlace =
-    input.marriagePlace ||
+  // Both halves, not `||`. `buildSearchUrl` sends `marriagePlace` AND
+  // `recordSubdivision` as simultaneous constraints, so when a caller supplies
+  // both, an `||` picks the event half and the same-place exclusion never sees
+  // the record-jurisdiction the search was also scoped to — handing that
+  // jurisdiction back as its own top alternative.
+  const searchedPlaces = [
+    input.marriagePlace,
     [input.recordSubdivision, input.recordCountry].filter(Boolean).join(", ") ||
-    undefined;
+      undefined,
+  ].filter((p): p is string => Boolean(p));
+  const searchedPlace = searchedPlaces[0];
+  const alsoSearchedPlaces = searchedPlaces.slice(1);
 
   // Same derivation as `marriageJurisdictionCandidates`'s own `windowStart`, so
   // the filter below and the ranker can never disagree about which window they
@@ -871,6 +902,7 @@ export async function recordSearchTool(
       const tree = await readProjectJson(input.projectPath, "tree.gedcomx.json");
       const candidates = marriageJurisdictionCandidates(tree, input.subjectId, {
         searchedPlace,
+        alsoSearchedPlaces,
         marriageYearFrom: input.marriageYearFrom,
         marriageYearTo: input.marriageYearTo,
       });
@@ -892,11 +924,18 @@ export async function recordSearchTool(
       // thin compiled trees this feature targets — could never fire (b) at all.
       // The note says "or on records this tree cannot date" rather than
       // claiming they are known to predate the window.
+      // Filters on `earliestAtPlace`, NOT `earliestYear`. The latter is the
+      // fact chosen to represent the place (closest to the window), so a place
+      // the tree attests both before AND during the window keeps its in-window
+      // fact and would fail a `<= windowStart` test — the place vanishes from
+      // the hint precisely because the tree knows more about it. Reproduced with
+      // Yell, Arkansas dated 1874 and 1880 against an 1878-1884 window: the
+      // exact lead this branch exists to surface.
       const earlier =
         windowStart === undefined
           ? []
           : candidates.filter(
-              (c) => c.earliestYear === null || c.earliestYear <= windowStart,
+              (c) => c.earliestAtPlace === null || c.earliestAtPlace <= windowStart,
             );
 
       // On (a) the whole ranked list is useful — the subject is not here, so
@@ -922,7 +961,7 @@ export async function recordSearchTool(
           note:
             foundNobody || windowStart === undefined
               ? JURISDICTION_NOTE_NOT_FOUND
-              : jurisdictionNoteEarlier(shown, windowStart),
+              : jurisdictionNoteEarlier(shown, windowStart, searchedPlace),
         };
       }
     } catch {

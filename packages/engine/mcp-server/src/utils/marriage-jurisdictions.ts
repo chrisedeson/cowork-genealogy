@@ -51,8 +51,29 @@ import { earliestYear } from "./date-helpers.js";
 export interface JurisdictionCandidate {
   /** The place as written on the fact (`standard_place` preferred). */
   place: string;
-  /** Earliest possible year for the fact, or null when the fact is undated. */
+  /**
+   * Year of the fact chosen to REPRESENT this place — the one closest to the
+   * search window, which is what the ranking is built on.
+   *
+   * The name is a trap and is kept only because the field is public and pinned
+   * by tests: this is NOT the earliest year the tree attests at this place. When
+   * a place carries several facts, the one nearest the window wins the dedupe
+   * below, and an in-window fact beats a pre-window one (its rankKey is
+   * negative). For "was this family here at or before the window?" use
+   * `earliestAtPlace`.
+   */
   earliestYear: number | null;
+  /**
+   * Minimum dated year across EVERY fact at this place, independent of which
+   * fact won the dedupe; null when the place has no dated fact at all.
+   *
+   * Exists because filtering on `earliestYear` silently loses places. A tree
+   * attesting Yell, Arkansas in both 1874 and 1880 against an 1878-1884 window
+   * keeps the 1880 fact as representative, so a `<= windowStart` test on
+   * `earliestYear` drops the place entirely — the tree knowing MORE about a
+   * place made it disappear from the hint.
+   */
+  earliestAtPlace: number | null;
   /**
    * `persons[].id` of whoever contributed the fact, or the literal `"couple"`
    * when it came from a Couple relationship rather than a person. The note tells
@@ -68,6 +89,13 @@ export interface JurisdictionCandidate {
 export interface MarriageSearchContext {
   /** `marriagePlace` as the caller spelled it — excluded from the results. */
   searchedPlace?: string;
+  /**
+   * Any OTHER place the same search was scoped to, excluded on equal footing.
+   * `buildSearchUrl` sends `marriagePlace` and `recordSubdivision` as
+   * simultaneous upstream constraints, so a search can be scoped to two places
+   * at once; excluding only one hands the other back as its own alternative.
+   */
+  alsoSearchedPlaces?: string[];
   marriageYearFrom?: number;
   marriageYearTo?: number;
 }
@@ -87,7 +115,20 @@ interface TreeLike {
  * expects, while the tree stores standardized forms — and an exact-string
  * comparison let the place just searched reappear as its own alternative.
  */
-const COUNTRY_TERMS = new Set(["united states", "usa", "us"]);
+const COUNTRY_TERMS = new Set([
+  "united states", "usa", "us",
+  // Non-US names matter because the gate is what stops a COUNTRY-wide search
+  // being treated as one that missed somewhere specific. With US spellings only,
+  // `recordCountry: "England"` passed as sub-country and both reasons turned
+  // routine on searches scoped to a whole country. Not exhaustive by nature —
+  // this is a heuristic over a caller-supplied string, and a country absent here
+  // degrades to the old behaviour rather than breaking.
+  "england", "scotland", "wales", "ireland", "northern ireland",
+  "united kingdom", "uk", "great britain", "canada", "australia",
+  "new zealand", "germany", "france", "italy", "spain", "portugal",
+  "netherlands", "belgium", "sweden", "norway", "denmark", "finland",
+  "poland", "mexico", "brazil", "south africa", "india",
+]);
 
 /** Comma-separated locality parts, lowercased, with `County`/`Co.` dropped. */
 function placeParts(place: string): string[] {
@@ -229,8 +270,11 @@ export function marriageJurisdictionCandidates(
   for (const { whose, fact } of contributions) {
     const place = fact?.standard_place || fact?.place;
     if (!place) continue;
-    if (context.searchedPlace && samePlace(place, context.searchedPlace))
-      continue;
+    const scopedTo = [
+      context.searchedPlace,
+      ...(context.alsoSearchedPlaces ?? []),
+    ].filter((p): p is string => Boolean(p));
+    if (scopedTo.some((sp) => samePlace(place, sp))) continue;
 
     const standardized = getStandardDate(fact);
     const year = standardized ? earliestYear(standardized) : null;
@@ -238,13 +282,25 @@ export function marriageJurisdictionCandidates(
     // Key on tokens so two spellings of one jurisdiction collapse together.
     const key = placeTokens(place).join("|") || place.toLowerCase();
     const existing = byPlace.get(key);
+    // Tracked across ALL facts at this place, not just the representative one,
+    // and carried forward on both branches of the dedupe below — a later fact
+    // winning the representative slot must not erase an earlier attestation.
+    const minSoFar =
+      existing?.earliestAtPlace === null || existing?.earliestAtPlace === undefined
+        ? year
+        : year === null
+          ? existing.earliestAtPlace
+          : Math.min(existing.earliestAtPlace, year);
     if (!existing || rankKey(year) < rankKey(existing.earliestYear)) {
       byPlace.set(key, {
         place,
         earliestYear: year,
+        earliestAtPlace: minSoFar,
         whose,
         fromFact: fact.type ?? "",
       });
+    } else {
+      existing.earliestAtPlace = minSoFar;
     }
   }
 

@@ -1049,8 +1049,13 @@ describe("recordSearchTool — jurisdiction hints when the marriage search FOUND
     // and she is indexed on it under her birth surname anyway. Worse, the
     // biconditional would tell an agent to distrust the single record that
     // carries the answer. Only the one-sided claim may ship.
-    expect(note).not.toContain("ONLY if");
-    expect(note).not.toContain("her first");
+    // Case-INSENSITIVE, and matched as a pattern rather than one exact spelling:
+    // the earlier guards were `not.toContain("ONLY if")` / `not.toContain("her
+    // first")`, so a lowercase "only if" or a reworded "if it was her first
+    // marriage" walked straight through the thing they exist to stop.
+    expect(note).not.toMatch(/only\s+if/i);
+    expect(note).not.toMatch(/\bher\s+first\b/i);
+    expect(note).not.toMatch(/first\s+marriage/i);
     expect(note).toContain("not by itself proof of her birth name");
   });
 
@@ -1079,6 +1084,63 @@ describe("recordSearchTool — jurisdiction hints when the marriage search FOUND
     // A county-scoped search does not reach a neighbouring county: the tree
     // offers Yell County while the answer sits in Nevada County, same state.
     expect(note).toContain("containing state");
+  });
+
+  it("still offers a place the tree also attests DURING the window", async () => {
+    mockFoundAndScored();
+    // The regression: a place carrying both a pre-window and an in-window fact.
+    // The in-window fact wins the per-place dedupe (its rankKey is negative), so
+    // filtering on `earliestYear` — the REPRESENTATIVE fact's year — drops the
+    // place outright. The tree knowing MORE about a place made it vanish from
+    // the hint. On `jimmie-jewel-neal` that place is Yell, Arkansas, the one
+    // lead this branch exists to surface.
+    await writeFile(
+      join(dir, "tree.gedcomx.json"),
+      JSON.stringify({
+        persons: [
+          {
+            id: "I1",
+            names: [{ given: "James", surname: "Neal" }],
+            facts: [
+              {
+                type: "Residence",
+                date: "1874",
+                standard_date: "1874",
+                place: "Yell, Arkansas, United States",
+                standard_place: "Yell, Arkansas, United States",
+              },
+              {
+                type: "Residence",
+                date: "1880",
+                standard_date: "1880",
+                place: "Yell, Arkansas, United States",
+                standard_place: "Yell, Arkansas, United States",
+              },
+            ],
+          },
+        ],
+        relationships: [],
+      }),
+      "utf-8",
+    );
+
+    const out = await recordSearchTool({
+      surname: "Neal",
+      givenName: "James",
+      recordType: "marriage",
+      marriagePlace: "Hill County, Texas",
+      marriageYearFrom: 1878,
+      marriageYearTo: 1884,
+      projectPath: dir,
+      subjectId: "I1",
+    });
+
+    const places = out.jurisdictionHints?.candidates.map((c) => c.place) ?? [];
+    expect(places).toContain("Yell, Arkansas, United States");
+    // And the note's range start is the real earliest attestation (1874), not
+    // the representative fact's year (1880) — which would tell the caller to
+    // search a range that excludes the very record being sought.
+    expect(out.jurisdictionHints?.note).toContain("1874 to 1878");
   });
 
   it("treats the window's START as the boundary, inclusively", async () => {
@@ -1305,6 +1367,11 @@ describe("recordSearchTool — jurisdiction hints when the marriage search FOUND
     expect(keys.indexOf("jurisdictionHints")).toBeLessThan(
       keys.indexOf("results"),
     );
+    // Pin the BRANCH. Without this the test passes when reason (a) fires in
+    // reason (b)'s place — (a) also serializes a hint, so every other assertion
+    // here is satisfied and (b) could break silently.
+    expect(out.jurisdictionHints?.note).not.toContain("did not find the subject");
+    expect(out.jurisdictionHints?.note).toContain("widen the date range");
     // The reorder rebuilds the response, so pin that it drops nothing. Reason
     // (b) fires only on searches that returned rows, which is exactly when
     // `results` is long enough to bury a trailing field.
